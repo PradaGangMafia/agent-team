@@ -39,6 +39,9 @@ class MockState:
         self.chat_headers: list[dict] = []
         self.image_mode = "images"  # or "chat"
         self.block_mode = ""  # "" or "cloudflare"
+        self.gateway_mode = False  # answer chat with a 504 gateway timeout
+        self.reject_stream = False  # 400 "stream not supported"
+        self.stream_requests = 0
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -100,6 +103,14 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
             return
         if self.path.endswith("/chat/completions"):
+            if self.state.gateway_mode:
+                page = b"<html><head><title>504 Gateway Time-out</title></head><body>504 Gateway Time-out</body></html>"
+                self.send_response(504)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(page)))
+                self.end_headers()
+                self.wfile.write(page)
+                return
             self._chat(json.loads(body))
         elif self.path.endswith("/images/edits"):
             self._edits(body)
@@ -114,6 +125,14 @@ class Handler(BaseHTTPRequestHandler):
         self.state.chat_headers.append(
             {"model": model, "headers": {k.lower(): v for k, v in self.headers.items()}}
         )
+        stream = bool(payload.get("stream"))
+        if stream:
+            self.state.stream_requests += 1
+            if self.state.reject_stream:
+                self._send_json(
+                    {"error": {"message": "stream is not supported by this server"}}, 400
+                )
+                return
         messages = payload.get("messages") or []
         assistant_turns = sum(1 for m in messages if m.get("role") == "assistant")
 
@@ -153,7 +172,7 @@ class Handler(BaseHTTPRequestHandler):
                     {"verdict": "pass", "notes": "mock manager verified"},
                     "call_m3",
                 )
-            self._reply_with_tool(call)
+            self._reply_with_tool(call, stream)
             return
 
         # worker
@@ -194,12 +213,66 @@ class Handler(BaseHTTPRequestHandler):
                 {"summary": "mock worker done", "status": "done"},
                 "call_w5",
             )
-        self._reply_with_tool(call)
+        self._reply_with_tool(call, stream)
 
-    def _reply_with_tool(self, call: dict) -> None:
+    def _reply_with_tool(self, call: dict, stream: bool = False) -> None:
+        if stream:
+            self._send_sse(call)
+            return
         self._send_json(
             {"choices": [{"message": {"role": "assistant", "content": "", "tool_calls": [call]}}]}
         )
+
+    def _send_sse(self, call: dict) -> None:
+        def emit(chunk: dict) -> None:
+            self.wfile.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        name = call["function"]["name"]
+        arguments = call["function"]["arguments"]
+        split = max(1, len(arguments) // 2)
+        emit({"choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
+        emit(
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": call["id"],
+                                    "type": "function",
+                                    "function": {"name": name, "arguments": ""},
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            }
+        )
+        # arguments arrive in fragments, as real providers stream them
+        for part in (arguments[:split], arguments[split:]):
+            emit(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"tool_calls": [{"index": 0, "function": {"arguments": part}}]},
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            )
+        emit({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]})
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+        self.close_connection = True
 
     def _edits(self, body: bytes) -> None:
         content_type = self.headers.get("Content-Type", "")
@@ -215,10 +288,18 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class ServerFixture:
-    def __init__(self, image_mode: str = "images", block_mode: str = "") -> None:
+    def __init__(
+        self,
+        image_mode: str = "images",
+        block_mode: str = "",
+        gateway_mode: bool = False,
+        reject_stream: bool = False,
+    ) -> None:
         self.state = MockState()
         self.state.image_mode = image_mode
         self.state.block_mode = block_mode
+        self.state.gateway_mode = gateway_mode
+        self.state.reject_stream = reject_stream
 
         handler = type("BoundHandler", (Handler,), {"state": self.state})
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -283,7 +364,27 @@ class TestHttpIntegration(unittest.TestCase):
         for key in [
             k
             for k in os.environ
-            if k.split("_")[0] in {"MANAGER", "WORKER", "IMAGE", "HTTP", "AGENT"}
+            if k.split("_")[0]
+            in {
+                "MANAGER",
+                "WORKER",
+                "IMAGE",
+                "HTTP",
+                "AGENT",
+                "STREAM",
+                "RETRY",
+                "PREFLIGHT",
+                "MAX",
+                "MIN",
+                "TASKS",
+                "WORK",
+                "LOGS",
+                "REF",
+                "ALLOW",
+                "SHELL",
+                "CONTINUE",
+                "REQUIRE",
+            }
         ]:
             os.environ.pop(key, None)
 
@@ -428,6 +529,102 @@ class TestHttpIntegration(unittest.TestCase):
         agents = [h.get("User-Agent", "") for h in state.request_headers]
         self.assertTrue(all("Chrome/" in a for a in agents))
         self.assertTrue(all("python" not in a.lower() for a in agents))
+
+
+    def test_streaming_is_used_by_default(self) -> None:
+        outcomes, root, cfg, state = self._run("images")
+        self.assertEqual([o.status for o in outcomes], ["done"], outcomes[0].notes)
+        self.assertTrue(state.stream_requests > 0)
+        self.assertEqual(state.stream_requests, len(state.chat_calls))
+
+    def test_streaming_can_be_disabled(self) -> None:
+        outcomes, root, cfg, state = self._run("images", extra_env={"STREAM": "false"})
+        self.assertEqual([o.status for o in outcomes], ["done"], outcomes[0].notes)
+        self.assertEqual(state.stream_requests, 0)
+
+    def test_stream_rejection_falls_back_to_json(self) -> None:
+        server = ServerFixture("images", reject_stream=True)
+        self.addCleanup(server.stop)
+        tmp = tempfile.TemporaryDirectory(prefix="agent-team-stream-")
+        self.addCleanup(tmp.cleanup)
+
+        saved_env = dict(os.environ)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved_env)))
+        for key in [k for k in os.environ if k.split("_")[0] in {"MANAGER", "WORKER", "IMAGE", "HTTP"}]:
+            os.environ.pop(key, None)
+
+        root = Path(tmp.name)
+        cfg = build_project(root, server.base_url, "images")
+        reporter = at.Reporter(cfg.logs_dir, quiet=True)
+        outcomes = at.Orchestrator(
+            cfg, reporter, at.ClientFactory(cfg, reporter)
+        ).run(at.discover_tasks(cfg))
+
+        self.assertEqual([o.status for o in outcomes], ["done"], outcomes[0].notes)
+        # each agent client tries streaming once, then switches to JSON for good
+        self.assertGreaterEqual(server.state.stream_requests, 1)
+        self.assertLess(server.state.stream_requests, len(server.state.chat_calls))
+        self.assertTrue((root / "work" / "images" / "variant_01.png").is_file())
+
+    def test_gateway_timeout_aborts_without_burning_attempts(self) -> None:
+        server = ServerFixture("images", gateway_mode=True)
+        self.addCleanup(server.stop)
+        tmp = tempfile.TemporaryDirectory(prefix="agent-team-gw-")
+        self.addCleanup(tmp.cleanup)
+
+        saved_env = dict(os.environ)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved_env)))
+        for key in [k for k in os.environ if k.split("_")[0] in {"MANAGER", "WORKER", "IMAGE", "HTTP"}]:
+            os.environ.pop(key, None)
+
+        root = Path(tmp.name)
+        cfg = build_project(root, server.base_url, "images")
+        for extra in ("p02", "p03"):
+            (root / "tasks" / f"{extra}.md").write_text(
+                f"---\nid: {extra}\ntitle: extra\n---\n\n# extra\n", encoding="utf-8"
+            )
+        reporter = at.Reporter(cfg.logs_dir, quiet=True)
+        orchestrator = at.Orchestrator(cfg, reporter, at.ClientFactory(cfg, reporter))
+
+        with self.assertRaises(at.EndpointError) as ctx:
+            orchestrator.run(at.discover_tasks(cfg))
+
+        self.assertEqual(ctx.exception.status, 504)
+        message = str(ctx.exception)
+        self.assertIn("Gateway timeout", message)
+        self.assertIn("STREAM", message)
+        # a 504 is not retried by default: one request only
+        self.assertEqual(len(server.state.request_headers), 1)
+        # the task is marked infrastructure error, the rest not attempted
+        self.assertEqual(
+            [(o.task.id, o.status) for o in orchestrator.results],
+            [("p01", "error"), ("p02", "not-run"), ("p03", "not-run")],
+        )
+        self.assertFalse((root / "logs" / "p01.log").exists())
+
+    def test_preflight_detects_unreachable_endpoint(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="agent-team-pre-")
+        self.addCleanup(tmp.cleanup)
+        saved_env = dict(os.environ)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved_env)))
+
+        root = Path(tmp.name)
+        cfg = build_project(root, "http://127.0.0.1:1/v1", "images")
+        reporter = at.Reporter(cfg.logs_dir, quiet=True)
+        self.assertFalse(at.preflight_endpoints(cfg, reporter))
+
+    def test_preflight_passes_on_live_endpoint(self) -> None:
+        server = ServerFixture("images")
+        self.addCleanup(server.stop)
+        tmp = tempfile.TemporaryDirectory(prefix="agent-team-pre2-")
+        self.addCleanup(tmp.cleanup)
+        saved_env = dict(os.environ)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved_env)))
+
+        root = Path(tmp.name)
+        cfg = build_project(root, server.base_url, "images")
+        reporter = at.Reporter(cfg.logs_dir, quiet=True)
+        self.assertTrue(at.preflight_endpoints(cfg, reporter))
 
 
 if __name__ == "__main__":

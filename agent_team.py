@@ -76,7 +76,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # ---------------------------------------------------------------------------
 # Small helpers: console output, ids, natural sorting
@@ -275,6 +275,8 @@ class AgentConfig:
     extra_body: dict[str, Any] = field(default_factory=dict)
     tokens_param: str = "max_tokens"
     headers: dict[str, str] = field(default_factory=dict)
+    stream: bool = True
+    idle_timeout: float = 300.0
 
     @property
     def endpoint(self) -> str:
@@ -299,6 +301,10 @@ class AgentConfig:
                 str(k): str(v)
                 for k, v in (env_json(f"{prefix}_HEADERS_JSON") or dict(fb.headers if fb else {})).items()
             },
+            stream=env_bool(f"{prefix}_STREAM", env_bool("STREAM", True)),
+            idle_timeout=env_float(
+                f"{prefix}_STREAM_IDLE_TIMEOUT", env_float("STREAM_IDLE_TIMEOUT", 300.0)
+            ),
         )
 
     def masked(self) -> str:
@@ -388,6 +394,10 @@ class Config:
     continue_on_failure: bool = False
     allow_shell: bool = True
     shell_timeout: float = 300.0
+    max_history_chars: int = 120000
+    preflight: bool = True
+    attach_max_dim: int = 1024
+    attach_jpeg_quality: int = 85
     tool_result_max_chars: int = 24000
     max_image_bytes: int = 8 * 1024 * 1024
     simulate: bool = False
@@ -437,6 +447,10 @@ class Config:
             continue_on_failure=env_bool("CONTINUE_ON_FAILURE", False),
             allow_shell=env_bool("ALLOW_SHELL", True),
             shell_timeout=env_float("SHELL_TIMEOUT", 300.0),
+            max_history_chars=env_int("MAX_HISTORY_CHARS", 120000),
+            preflight=env_bool("PREFLIGHT_CHECK", True),
+            attach_max_dim=env_int("IMAGE_ATTACH_MAX_DIM", 1024),
+            attach_jpeg_quality=env_int("IMAGE_ATTACH_JPEG_QUALITY", 85),
             tool_result_max_chars=env_int("TOOL_RESULT_MAX_CHARS", 24000),
             max_image_bytes=env_int("MAX_IMAGE_BYTES", 8 * 1024 * 1024),
             simulate=env_bool("AGENT_TEAM_SIMULATE", False),
@@ -474,6 +488,9 @@ class Config:
             f"{'worker rounds'.ljust(w)} {self.max_rounds_worker}",
             f"{'manager rounds'.ljust(w)} {self.max_rounds_manager}",
             f"{'shell tools'.ljust(w)} {'enabled' if self.allow_shell else 'disabled'}",
+            f"{'streaming'.ljust(w)} manager={'on' if self.manager.stream else 'off'} "
+            f"worker={'on' if self.worker.stream else 'off'}",
+            f"{'preflight'.ljust(w)} {'on' if self.preflight else 'off'}",
             f"{'simulate'.ljust(w)} {'yes' if self.simulate else 'no'}",
         ]
         return "\n".join(lines)
@@ -492,6 +509,30 @@ class EndpointError(RuntimeError):
 
 
 RETRY_STATUS = {408, 409, 425, 429, 500, 502, 503, 504, 522, 524}
+# Gateway timeouts mean the origin took too long (Cloudflare allows ~100 s).
+# Retrying the same oversized request usually just burns another minute.
+GATEWAY_STATUS = {504, 522, 524}
+
+
+def _retryable(status: int) -> bool:
+    if status in GATEWAY_STATUS:
+        return env_bool("RETRY_GATEWAY_ERRORS", False)
+    return status in RETRY_STATUS
+
+
+GATEWAY_HINT = (
+    "Gateway timeout: the model did not answer before the proxy's limit "
+    "(Cloudflare allows ~100 s for a non-streaming response).\n"
+    "  - Streaming is now the default (STREAM=true) and keeps the connection alive; "
+    "check that it is not disabled for this agent (MANAGER_STREAM / WORKER_STREAM).\n"
+    "  - Shrink the request: MAX_HISTORY_CHARS trims old tool output and images "
+    "automatically; lower WORKER_MAX_TOKENS, or use a smaller/faster model.\n"
+    "  - A long prompt prefill can exceed the proxy limit before the first token; "
+    "split the task into smaller prompts in tasks/.\n"
+    "  - Or raise the origin timeout on the Cloudflare side (paid plans) / bypass "
+    "the proxy for this endpoint.\n"
+    "  - Set RETRY_GATEWAY_ERRORS=true if you want automatic retries anyway."
+)
 
 # A current desktop Chrome UA. Python's default "Python-urllib/3.x" is exactly
 # what Cloudflare's bot protection (error 1010, "browser signature banned")
@@ -593,6 +634,116 @@ def browser_headers() -> dict[str, str]:
     return headers
 
 
+def _collect_stream_body(response: Any) -> bytes:
+    """Read a curl_cffi response that was opened with stream=True."""
+    try:
+        chunks = list(response.iter_content())
+    except Exception:
+        return b""
+    return b"".join(bytes(chunk) for chunk in chunks if chunk)
+
+
+def _open_stream_lines(
+    url: str,
+    data: bytes,
+    headers: dict[str, str],
+    timeout: float,
+):
+    """Yield raw lines from a streaming POST.
+
+    Handles SSE and servers that ignore ``stream`` and answer with plain JSON.
+    """
+    content_type = ""
+    body_lines = None
+
+    if http_backend() == "curl_cffi":
+        module = _curl_cffi()
+        if module is not None:
+            response = module.request(
+                "POST",
+                url,
+                data=data,
+                headers=headers,
+                timeout=timeout,
+                impersonate=env_str("HTTP_IMPERSONATE", "chrome") or "chrome",
+                allow_redirects=True,
+                stream=True,
+            )
+            try:
+                content_type = response.headers.get("Content-Type", "")
+                status = int(response.status_code)
+                if status >= 400:
+                    raw = _collect_stream_body(response)
+                    raise _http_error(url, status, raw.decode("utf-8", "replace"), content_type)
+                if "application/json" in content_type.lower():
+                    raw = _collect_stream_body(response)
+                    yield b"data: " + raw.replace(b"\r", b" ").replace(b"\n", b" ")
+                    return
+                for line in response.iter_lines():
+                    if line:
+                        yield line if isinstance(line, bytes) else str(line).encode("utf-8")
+                return
+            finally:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+
+    request = urllib.request.Request(url, data=data, method="POST")
+    for key, value in headers.items():
+        request.add_header(key, value)
+    try:
+        response = urllib.request.urlopen(request, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        raw = b""
+        try:
+            raw = exc.read()
+        except Exception:
+            pass
+        ctype = exc.headers.get("Content-Type", "") if exc.headers else ""
+        raise _http_error(url, int(exc.code), raw.decode("utf-8", "replace"), ctype) from None
+    try:
+        content_type = response.headers.get("Content-Type", "")
+        if "application/json" in content_type.lower():
+            raw = response.read()
+            yield b"data: " + raw.replace(b"\r", b" ").replace(b"\n", b" ")
+            return
+        for line in response:
+            if line.strip():
+                yield line
+    finally:
+        try:
+            response.close()
+        except Exception:
+            pass
+
+
+def _stream_lines(
+    url: str,
+    data: bytes,
+    headers: dict[str, str],
+    timeout: float,
+    retries: int = 2,
+):
+    """Yield SSE lines, retrying only while nothing has been received yet."""
+    attempts = max(1, retries)
+    for attempt in range(attempts):
+        received = False
+        try:
+            for line in _open_stream_lines(url, data, headers, timeout):
+                received = True
+                yield line
+            return
+        except EndpointError as exc:
+            if received or attempt == attempts - 1 or not _retryable(exc.status or 0):
+                raise
+            time.sleep(min(2 ** attempt, 10) + random.uniform(0, 0.3))
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if received or attempt == attempts - 1:
+                raise EndpointError(f"stream from {url} broke after data arrived: {exc}") from exc
+            time.sleep(min(2 ** attempt, 10) + random.uniform(0, 0.3))
+
+
 def _auth_headers(api_key: str, extra: dict[str, str] | None = None) -> dict[str, str]:
     """Browser headers + per-agent overrides + bearer token."""
     headers = browser_headers()
@@ -611,9 +762,11 @@ def _looks_like_cloudflare(status: int | None, body: str, content_type: str = ""
 
 
 def _http_error(url: str, status: int, body: str, content_type: str = "") -> EndpointError:
-    message = f"HTTP {status} from {url}: {short(body, 600)}"
+    message = f"HTTP {status} from {url}: {short(body, 700)}"
     if _looks_like_cloudflare(status, body, content_type):
         message += "\n" + CF_HINT
+    if status in GATEWAY_STATUS or "gateway time-out" in body.lower() or "gateway timeout" in body.lower():
+        message += "\n" + GATEWAY_HINT
     return EndpointError(message, status, body)
 
 
@@ -704,7 +857,7 @@ def _request_bytes(
 
         body = raw.decode("utf-8", "replace")
         last_error = _http_error(url, status, body, content_type)
-        if status not in RETRY_STATUS or attempt == attempts - 1:
+        if not _retryable(status) or attempt == attempts - 1:
             raise last_error
         retry_after = None
         try:
@@ -795,13 +948,21 @@ def _parse_arguments(raw: Any) -> dict[str, Any]:
 
 
 class ChatClient:
-    """Minimal OpenAI-compatible chat completions client."""
+    """OpenAI-compatible chat client with SSE streaming and JSON fallback.
+
+    Streaming is on by default because a long non-streaming completion is the
+    classic way to collect a Cloudflare 504/524: bytes keep flowing, so the proxy
+    does not cut the connection while the model is still thinking.
+    """
 
     def __init__(self, cfg: AgentConfig, reporter: Reporter | None = None):
         self.cfg = cfg
         self.reporter = reporter
         self.calls = 0
+        self.stream = cfg.stream
+        self._stream_rejected = False
 
+    # -- public ----------------------------------------------------------
     def chat(
         self,
         messages: list[dict[str, Any]],
@@ -822,19 +983,51 @@ class ChatClient:
             payload["tool_choice"] = "auto"
         payload.update(self.cfg.extra_body)
 
-        body = json.dumps(payload).encode("utf-8")
         headers = _auth_headers(self.cfg.api_key, self.cfg.headers)
         headers["Content-Type"] = "application/json"
+        headers["Accept"] = "text/event-stream" if self.stream else "application/json"
 
         self.calls += 1
         started = time.time()
+
+        if self.stream:
+            payload["stream"] = True
+            try:
+                message = self._stream(payload, headers, timeout)
+            except EndpointError as exc:
+                if not self._stream_rejected_by_server(exc):
+                    raise
+                self.stream = False
+                self._stream_rejected = True
+                payload.pop("stream", None)
+                headers["Accept"] = "application/json"
+                if self.reporter:
+                    self.reporter.warn(
+                        f"{self.cfg.role}: endpoint rejected streaming ({exc.status}); "
+                        "falling back to non-streaming responses for this run"
+                    )
+            else:
+                self._debug_usage(started, message, streamed=True)
+                return message
+
+        message = self._json(payload, headers, timeout)
+        self._debug_usage(
+            started,
+            message,
+            streamed=False,
+            response_type="",
+        )
+        return message
+
+    # -- non-streaming ---------------------------------------------------
+    def _json(self, payload: dict[str, Any], headers: dict[str, str], timeout: float | None) -> dict[str, Any]:
+        body = json.dumps(payload).encode("utf-8")
         raw, response_type = _request_bytes(
             self.cfg.endpoint,
             data=body,
             headers=headers,
             timeout=timeout or self.cfg.timeout,
         )
-        elapsed = time.time() - started
         text = raw.decode("utf-8", "replace")
         try:
             data = json.loads(text)
@@ -845,22 +1038,139 @@ class ChatClient:
                 f"{self.cfg.role}: response from {self.cfg.endpoint} was not JSON: "
                 f"{short(text, 400)}"
             ) from exc
+        return self._message_from_response(data)
 
+    def _message_from_response(self, data: dict[str, Any]) -> dict[str, Any]:
         choices = data.get("choices") or []
         if not choices:
             raise EndpointError(
                 f"{self.cfg.role}: no choices returned by {self.cfg.endpoint}: "
                 f"{short(json.dumps(data), 400)}"
             )
-        message = choices[0].get("message") or {}
-        usage = data.get("usage") or {}
-        if self.reporter:
-            self.reporter.debug(
-                f"{self.cfg.role} model={self.cfg.model} {elapsed:.1f}s "
-                f"tokens={usage.get('prompt_tokens', '?')}/"
-                f"{usage.get('completion_tokens', '?')}"
+        return choices[0].get("message") or {}
+
+    # -- streaming -------------------------------------------------------
+    def _stream(
+        self,
+        payload: dict[str, Any],
+        headers: dict[str, str],
+        timeout: float | None,
+    ) -> dict[str, Any]:
+        body = json.dumps(payload).encode("utf-8")
+        idle = max(30.0, float(self.cfg.idle_timeout or 300.0))
+        content: list[str] = []
+        calls: dict[int, dict[str, Any]] = {}
+        got_chunk = False
+        finish_reason: str | None = None
+
+        for raw in _stream_lines(self.cfg.endpoint, body, headers, idle):
+            line = raw.decode("utf-8", "replace").strip()
+            if not line or line.startswith(":"):
+                continue
+            if line.startswith("data:"):
+                line = line[5:].strip()
+            if line in {"[DONE]", "done"}:
+                break
+            try:
+                chunk = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(chunk, dict):
+                continue
+            if chunk.get("error"):
+                raise EndpointError(
+                    f"{self.cfg.role}: streaming error from {self.cfg.endpoint}: "
+                    f"{short(json.dumps(chunk['error']), 400)}"
+                )
+            got_chunk = True
+            for choice in chunk.get("choices") or []:
+                if not isinstance(choice, dict):
+                    continue
+                finish_reason = choice.get("finish_reason") or finish_reason
+                delta = choice.get("delta")
+                if not isinstance(delta, dict) or not delta:
+                    delta = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+                text = _text_of(delta.get("content"))
+                if text:
+                    content.append(text)
+                for position, call in enumerate(delta.get("tool_calls") or []):
+                    if not isinstance(call, dict):
+                        continue
+                    index = call.get("index", position)
+                    if not isinstance(index, int):
+                        index = position
+                    slot = calls.setdefault(
+                        index,
+                        {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                    )
+                    if call.get("id"):
+                        slot["id"] = str(call["id"])
+                    function = call.get("function") or {}
+                    if function.get("name"):
+                        slot["function"]["name"] = str(function["name"])
+                    arguments = function.get("arguments")
+                    if isinstance(arguments, str):
+                        slot["function"]["arguments"] += arguments
+                    elif isinstance(arguments, dict):
+                        slot["function"]["arguments"] = json.dumps(arguments)
+
+        if not got_chunk:
+            raise EndpointError(
+                f"{self.cfg.role}: endpoint {self.cfg.endpoint} returned an empty stream"
             )
+
+        message: dict[str, Any] = {"role": "assistant", "content": "".join(content)}
+        tool_calls = []
+        for index in sorted(calls):
+            slot = calls[index]
+            if not slot["function"]["name"]:
+                continue
+            if not slot["id"]:
+                slot["id"] = "call_" + uuid.uuid4().hex[:12]
+            tool_calls.append(slot)
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        if finish_reason:
+            message["_finish_reason"] = finish_reason
         return message
+
+    # -- helpers ---------------------------------------------------------
+    @staticmethod
+    def _stream_rejected_by_server(exc: EndpointError) -> bool:
+        if exc.status in {400, 404, 405, 415, 422, 501}:
+            body = (exc.body or "").lower()
+            return (
+                "stream" in body
+                or exc.status in {404, 405, 501}
+                or "unsupported" in body
+                or "unknown field" in body
+                or "invalid parameter" in body
+            )
+        return False
+
+    def _debug_usage(
+        self,
+        started: float,
+        message: dict[str, Any],
+        *,
+        streamed: bool,
+        response_type: str = "",
+    ) -> None:
+        if not self.reporter:
+            return
+        elapsed = time.time() - started
+        content_chars = len(_text_of(message.get("content")))
+        call_names = ", ".join(
+            str((call.get("function") or {}).get("name"))
+            for call in (message.get("tool_calls") or [])
+            if isinstance(call, dict)
+        )
+        self.reporter.debug(
+            f"{self.cfg.role} model={self.cfg.model} {elapsed:.1f}s "
+            f"{'stream' if streamed else 'json'} "
+            f"chars={content_chars}"
+            + (f" tools=[{call_names}]" if call_names else "")
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1116,6 +1426,108 @@ def _download(url: str) -> bytes:
 def data_url(path: Path) -> str:
     mime = mimetypes.guess_type(path.name)[0] or "image/png"
     return f"data:{mime};base64," + base64.b64encode(path.read_bytes()).decode()
+
+
+def attachment_data_url(
+    path: Path,
+    max_dim: int = 1024,
+    quality: int = 85,
+) -> str:
+    """Data URL for vision messages, downscaled when Pillow is available.
+
+    A 1.3 MB master PNG becomes a ~100 KB JPEG, which keeps the prompt small -
+    large payloads are what make local models slow enough to hit gateway
+    timeouts.
+    """
+    data = path.read_bytes()
+    mime = mimetypes.guess_type(path.name)[0] or "image/png"
+    if max_dim > 0 and mime != "image/gif":
+        try:
+            import io
+
+            from PIL import Image  # type: ignore
+
+            with Image.open(io.BytesIO(data)) as image:
+                if max(image.size) > max_dim or len(data) > 1_000_000:
+                    converted = image.convert("RGB")
+                    converted.thumbnail((max_dim, max_dim))
+                    buffer = io.BytesIO()
+                    converted.save(buffer, format="JPEG", quality=quality, optimize=True)
+                    data = buffer.getvalue()
+                    mime = "image/jpeg"
+        except Exception:
+            pass  # Pillow missing or unreadable image: send the original bytes
+    return f"data:{mime};base64," + base64.b64encode(data).decode()
+
+
+def _message_chars(message: dict[str, Any]) -> int:
+    size = len(json.dumps(message.get("content"), ensure_ascii=False, default=str))
+    for call in message.get("tool_calls") or []:
+        if isinstance(call, dict):
+            function = call.get("function") or {}
+            size += len(str(function.get("name") or "")) + len(
+                str(function.get("arguments") or "")
+            )
+    return size
+
+
+def trim_history(history: list[dict[str, Any]], limit: int, keep_recent: int = 6) -> int:
+    """Shrink a conversation in place so prompts stay inside the context budget.
+
+    Old image attachments are dropped first, then old tool outputs, then old
+    assistant prose. Message structure (assistant tool_calls followed by their
+    tool results) is preserved - only contents change - and the most recent
+    turns are never touched. Returns the resulting size in characters.
+    """
+    if limit <= 0 or len(history) <= 2:
+        return sum(_message_chars(m) for m in history)
+
+    total = sum(_message_chars(m) for m in history)
+    if total <= limit:
+        return total
+
+    cutoff = max(2, len(history) - keep_recent)
+
+    def recount() -> int:
+        return sum(_message_chars(m) for m in history)
+
+    # 1) strip images from older messages
+    for message in history[2:cutoff]:
+        content = message.get("content")
+        if isinstance(content, list) and any(
+            isinstance(part, dict) and part.get("type") == "image_url" for part in content
+        ):
+            message["content"] = [
+                {"type": "text", "text": "[image removed from history to save context]"}
+                if isinstance(part, dict) and part.get("type") == "image_url"
+                else part
+                for part in content
+            ]
+    total = recount()
+    if total <= limit:
+        return total
+
+    # 2) truncate old tool output (oldest first)
+    for message in history[2:cutoff]:
+        if message.get("role") == "tool":
+            text = str(message.get("content") or "")
+            if len(text) > 400:
+                message["content"] = text[:400] + " …[older output trimmed]"
+                total = recount()
+                if total <= limit:
+                    return total
+
+    # 3) truncate old assistant prose
+    for message in history[2:cutoff]:
+        if message.get("role") == "assistant":
+            text = str(message.get("content") or "")
+            if len(text) > 800:
+                message["content"] = text[:800] + " …[older answer trimmed]"
+                total = recount()
+                if total <= limit:
+                    return total
+
+    return recount()
 
 
 def _extract_images(obj: Any) -> list[tuple[str, str]]:
@@ -1692,6 +2104,11 @@ class WorkerAgent:
         nudges = 0
 
         for round_no in range(1, self.cfg.max_rounds_worker + 1):
+            if trim_history(self.history, self.cfg.max_history_chars) > self.cfg.max_history_chars:
+                self.reporter.debug(
+                    f"worker {self.task.id}: history still {self.cfg.max_history_chars}+ "
+                    "chars after trimming (recent turns preserved)"
+                )
             message = self.client.chat(self.history, tools=WORKER_TOOLS)
             calls = normalise_tool_calls(message)
             content = _text_of(message.get("content"))
@@ -1766,7 +2183,16 @@ class WorkerAgent:
                 if path.stat().st_size > self.cfg.max_image_bytes:
                     parts.append({"type": "text", "text": f"(skipped large image {self.sandbox.rel(path)})"})
                     continue
-                parts.append({"type": "image_url", "image_url": {"url": data_url(path)}})
+                parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": attachment_data_url(
+                                path, self.cfg.attach_max_dim, self.cfg.attach_jpeg_quality
+                            )
+                        },
+                    }
+                )
                 ok += 1
             except OSError as exc:
                 parts.append({"type": "text", "text": f"(could not attach {path.name}: {exc})"})
@@ -1992,6 +2418,7 @@ class ManagerAgent:
     def attempt(self, attempt: int) -> ManagerVerdict:
         self.verdict = ManagerVerdict("none")
         for _ in range(1, self.cfg.max_rounds_manager + 1):
+            trim_history(self.history, self.cfg.max_history_chars)
             message = self.client.chat(self.history, tools=MANAGER_TOOLS)
             calls = normalise_tool_calls(message)
             content = _text_of(message.get("content"))
@@ -2021,8 +2448,10 @@ class ManagerAgent:
                     result, attach = self.dispatch(name, args)
                 except ToolError as exc:
                     result, attach = f"ERROR: {exc}", []
-                except EndpointError as exc:
-                    result, attach = f"ERROR (endpoint): {exc}", []
+                except EndpointError:
+                    # Endpoint failures are infrastructure, not the model's fault:
+                    # never let the manager "explain" them away or burn task attempts.
+                    raise
                 except Exception as exc:  # noqa: BLE001
                     self.reporter.debug(traceback.format_exc())
                     result, attach = f"ERROR ({type(exc).__name__}): {exc}", []
@@ -2034,7 +2463,16 @@ class ManagerAgent:
                 parts: list[dict[str, Any]] = [{"type": "text", "text": "Attached image(s):"}]
                 for path in attachments[:4]:
                     try:
-                        parts.append({"type": "image_url", "image_url": {"url": data_url(path)}})
+                        parts.append(
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": attachment_data_url(
+                                        path, self.cfg.attach_max_dim, self.cfg.attach_jpeg_quality
+                                    )
+                                },
+                            }
+                        )
                     except OSError:
                         pass
                 self.history.append({"role": "user", "content": parts})
@@ -2242,7 +2680,19 @@ class Orchestrator:
                 self.results.append(TaskOutcome(task, "skipped", 0, "workflow halted earlier"))
                 continue
             self.reporter.banner(f"Task {index}/{len(tasks)} — {task.id}: {task.title}")
-            outcome = self.run_task(task, all_tasks, completed, manager_prompt, worker_prompt)
+            try:
+                outcome = self.run_task(task, all_tasks, completed, manager_prompt, worker_prompt)
+            except EndpointError as exc:
+                # Infrastructure, not the task: stop cleanly and say what happened.
+                self.results.append(
+                    TaskOutcome(task, "error", 0, short(str(exc), 300))
+                )
+                for remaining in tasks[index:]:
+                    self.results.append(
+                        TaskOutcome(remaining, "not-run", 0, "workflow stopped on endpoint failure")
+                    )
+                self._print_summary()
+                raise
             self.results.append(outcome)
             completed.append(outcome)
 
@@ -2364,11 +2814,18 @@ class Orchestrator:
 
     def _print_summary(self) -> None:
         self.reporter.banner("Workflow summary")
+        icons = {
+            "done": green("✓"),
+            "skipped": yellow("»"),
+            "failed": red("✗"),
+            "error": red("!"),
+            "not-run": dim("–"),
+        }
         for outcome in self.results:
-            icon = {"done": green("✓"), "skipped": yellow("»"), "failed": red("✗")}[outcome.status]
+            icon = icons.get(outcome.status, "?")
             self.reporter.raw(
                 f"  {icon} {outcome.task.id.ljust(6)} {outcome.status.ljust(8)} "
-                f"{outcome.attempts} attempt(s)  {short(outcome.notes, 90)}"
+                f"{outcome.attempts} attempt(s)  {short(outcome.notes, 100)}"
             )
             for rel in outcome.changed[:6]:
                 self.reporter.raw(dim(f"      work/{rel}"))
@@ -2501,6 +2958,51 @@ class SimulatedLLM:
 # ---------------------------------------------------------------------------
 
 
+def preflight_endpoints(cfg: Config, reporter: Reporter) -> bool:
+    """Cheap reachability check so a broken endpoint fails before any task runs."""
+    if cfg.simulate or not cfg.preflight:
+        return True
+    healthy = True
+    for label, agent in (("manager", cfg.manager), ("worker", cfg.worker)):
+        if not agent.base_url:
+            continue
+        url = agent.base_url.rstrip("/") + "/models"
+        try:
+            raw, _ = _request_bytes(
+                url,
+                method="GET",
+                headers=_auth_headers(agent.api_key, agent.headers),
+                timeout=30.0,
+                retries=1,
+            )
+        except EndpointError as exc:
+            if exc.status in {404, 405}:
+                reporter.warn(
+                    f"preflight {label}: /models not supported by the server (reachable)"
+                )
+                continue
+            reporter.error(f"preflight {label} failed:\n{exc}")
+            healthy = False
+            continue
+        try:
+            data = json.loads(raw.decode("utf-8", "replace"))
+            ids = [m.get("id") for m in data.get("data", []) if isinstance(m, dict)]
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            reporter.warn(f"preflight {label}: /models returned non-JSON (reachable)")
+            continue
+        if ids and agent.model not in ids:
+            reporter.warn(
+                f"preflight {label}: reachable, but '{agent.model}' is not in the "
+                f"{len(ids)} model(s) the endpoint lists"
+            )
+        else:
+            reporter.ok(
+                f"preflight {label}: {agent.model} via {agent.endpoint} "
+                f"({'streaming' if agent.stream else 'non-streaming'})"
+            )
+    return healthy
+
+
 def cmd_run(cfg: Config, reporter: Reporter, args: argparse.Namespace) -> int:
     cfg.simulate = cfg.simulate or args.simulate
     if cfg.simulate:
@@ -2546,6 +3048,13 @@ def cmd_run(cfg: Config, reporter: Reporter, args: argparse.Namespace) -> int:
                 "will fail until you configure it (or use IMAGE_MODE=chat)"
             )
 
+    if not preflight_endpoints(cfg, reporter):
+        reporter.error(
+            "endpoint preflight failed — no tasks were started (fix .env or the "
+            "endpoint, then rerun; PREFLIGHT_CHECK=false skips this check)"
+        )
+        return 3
+
     orchestrator = Orchestrator(cfg, reporter, ClientFactory(cfg, reporter))
     try:
         outcomes = orchestrator.run(tasks, all_tasks=discover_tasks(cfg))
@@ -2553,8 +3062,11 @@ def cmd_run(cfg: Config, reporter: Reporter, args: argparse.Namespace) -> int:
         reporter.warn("interrupted by user")
         return 130
     except EndpointError as exc:
-        reporter.error(f"endpoint failure: {exc}")
-        return 1
+        reporter.error(
+            "endpoint failure — the workflow stopped. Completed tasks are kept, the "
+            f"rest were not attempted.\n{exc}"
+        )
+        return 3
 
     failed = [o for o in outcomes if o.status == "failed"]
     if failed:
@@ -2859,6 +3371,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--simulate", "--dry-run", dest="simulate", action="store_true",
                      help="offline simulation, no network calls")
     run.add_argument("--attempts", type=int, help="override MAX_TASK_ATTEMPTS")
+    run.add_argument("--no-preflight", action="store_true", help="skip the endpoint reachability check")
     run.set_defaults(func=cmd_run)
 
     doctor = sub.add_parser("doctor", help="validate configuration and endpoints")
@@ -2892,6 +3405,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     cfg.quiet = bool(args.quiet)
     if getattr(args, "attempts", None):
         cfg.max_task_attempts = max(1, args.attempts)
+    if getattr(args, "no_preflight", False):
+        cfg.preflight = False
 
     try:
         cfg.ensure_dirs()

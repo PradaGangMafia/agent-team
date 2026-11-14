@@ -35,7 +35,10 @@ class MockState:
         self.chat_calls: list[dict] = []
         self.image_edits: list[dict] = []
         self.auth_headers: list[str] = []
+        self.request_headers: list[dict] = []
+        self.chat_headers: list[dict] = []
         self.image_mode = "images"  # or "chat"
+        self.block_mode = ""  # "" or "cloudflare"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -75,6 +78,27 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         body = self._read_body()
         self.state.auth_headers.append(self.headers.get("Authorization", ""))
+        self.state.request_headers.append(dict(self.headers.items()))
+        if self.state.block_mode == "cloudflare":
+            payload = json.dumps(
+                {
+                    "type": "https://developers.cloudflare.com/support/troubleshooting/"
+                    "http-status-codes/cloudflare-1xxx-errors/error-1010/",
+                    "title": "Error 1010: Access denied",
+                    "status": 403,
+                    "detail": "The site owner has blocked access based on your browser's signature.",
+                    "error_code": 1010,
+                    "error_name": "browser_signature_banned",
+                    "cloudflare_error": True,
+                    "retryable": False,
+                }
+            ).encode()
+            self.send_response(403)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if self.path.endswith("/chat/completions"):
             self._chat(json.loads(body))
         elif self.path.endswith("/images/edits"):
@@ -87,6 +111,9 @@ class Handler(BaseHTTPRequestHandler):
     def _chat(self, payload: dict) -> None:
         self.state.chat_calls.append(payload)
         model = payload.get("model")
+        self.state.chat_headers.append(
+            {"model": model, "headers": {k.lower(): v for k, v in self.headers.items()}}
+        )
         messages = payload.get("messages") or []
         assistant_turns = sum(1 for m in messages if m.get("role") == "assistant")
 
@@ -188,9 +215,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class ServerFixture:
-    def __init__(self, image_mode: str = "images") -> None:
+    def __init__(self, image_mode: str = "images", block_mode: str = "") -> None:
         self.state = MockState()
         self.state.image_mode = image_mode
+        self.state.block_mode = block_mode
 
         handler = type("BoundHandler", (Handler,), {"state": self.state})
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -207,7 +235,12 @@ class ServerFixture:
         self.httpd.server_close()
 
 
-def build_project(root: Path, base_url: str, image_mode: str = "images") -> at.Config:
+def build_project(
+    root: Path,
+    base_url: str,
+    image_mode: str = "images",
+    extra_env: dict[str, str] | None = None,
+) -> at.Config:
     for name in ("tasks", "ref", "logs", "work"):
         (root / name).mkdir(parents=True, exist_ok=True)
     (root / "manager.md").write_text("# MANAGER AGENT\n\nDelegate and verify.\n", encoding="utf-8")
@@ -222,7 +255,8 @@ def build_project(root: Path, base_url: str, image_mode: str = "images") -> at.C
         f"MANAGER_BASE_URL={base_url}\nMANAGER_API_KEY=test-key\nMANAGER_MODEL={MANAGER_MODEL}\n"
         f"WORKER_BASE_URL={base_url}\nWORKER_API_KEY=test-key\nWORKER_MODEL={WORKER_MODEL}\n"
         f"IMAGE_BASE_URL={base_url}\nIMAGE_API_KEY=test-key\nIMAGE_MODEL=mock-image\n"
-        f"IMAGE_MODE={image_mode}\nIMAGE_SIZE=512x512\n",
+        f"IMAGE_MODE={image_mode}\nIMAGE_SIZE=512x512\n"
+        + "".join(f"{key}={value}\n" for key, value in (extra_env or {}).items()),
         encoding="utf-8",
     )
     cfg = at.Config.load(root)
@@ -237,20 +271,29 @@ def build_project(root: Path, base_url: str, image_mode: str = "images") -> at.C
 
 
 class TestHttpIntegration(unittest.TestCase):
-    def _run(self, image_mode: str = "images"):
+    def _run(
+        self,
+        image_mode: str = "images",
+        block_mode: str = "",
+        extra_env: dict[str, str] | None = None,
+    ):
         # .env values land in os.environ; keep every test isolated.
         saved_env = dict(os.environ)
         self.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved_env)))
-        for key in [k for k in os.environ if k.split("_")[0] in {"MANAGER", "WORKER", "IMAGE"}]:
+        for key in [
+            k
+            for k in os.environ
+            if k.split("_")[0] in {"MANAGER", "WORKER", "IMAGE", "HTTP", "AGENT"}
+        ]:
             os.environ.pop(key, None)
 
-        server = ServerFixture(image_mode)
+        server = ServerFixture(image_mode, block_mode)
         self.addCleanup(server.stop)
         tmp = tempfile.TemporaryDirectory(prefix="agent-team-http-")
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
 
-        cfg = build_project(root, server.base_url, image_mode)
+        cfg = build_project(root, server.base_url, image_mode, extra_env)
         reporter = at.Reporter(cfg.logs_dir, quiet=True)
         orchestrator = at.Orchestrator(cfg, reporter, at.ClientFactory(cfg, reporter))
         outcomes = orchestrator.run(at.discover_tasks(cfg))
@@ -307,6 +350,84 @@ class TestHttpIntegration(unittest.TestCase):
             any("data:image/png;base64," in json.dumps(c) for c in worker_calls[1:]),
             "reference image was not attached to the worker conversation",
         )
+
+
+    def test_requests_look_like_a_real_browser(self) -> None:
+        outcomes, root, cfg, state = self._run("images")
+        self.assertEqual([o.status for o in outcomes], ["done"], outcomes[0].notes)
+        agents = [h.get("User-Agent", "") for h in state.request_headers]
+        self.assertTrue(agents)
+        for agent in agents:
+            self.assertIn("Mozilla/5.0", agent)
+            self.assertIn("Chrome/", agent)
+            self.assertNotIn("Python-urllib", agent)
+        # browser-ish extras are present too
+        first = {k.lower(): v for k, v in state.request_headers[0].items()}
+        self.assertIn("accept-language", first)
+        self.assertIn("sec-ch-ua", first)
+
+    def test_custom_headers_from_env(self) -> None:
+        outcomes, root, cfg, state = self._run(
+            "images",
+            extra_env={
+                "HTTP_HEADERS_JSON": '{"X-Global": "everywhere"}',
+                "WORKER_HEADERS_JSON": '{"X-Agent": "worker-only"}',
+                "HTTP_USER_AGENT": "MyCustomAgent/9.9",
+            },
+        )
+        self.assertEqual([o.status for o in outcomes], ["done"], outcomes[0].notes)
+
+        lowered = [{k.lower(): v for k, v in h.items()} for h in state.request_headers]
+        self.assertTrue(all(h.get("x-global") == "everywhere" for h in lowered))
+
+        worker_requests = [
+            entry["headers"] for entry in state.chat_headers if entry["model"] == WORKER_MODEL
+        ]
+        manager_requests = [
+            entry["headers"] for entry in state.chat_headers if entry["model"] == MANAGER_MODEL
+        ]
+        self.assertTrue(worker_requests and manager_requests)
+        self.assertTrue(all(h.get("x-agent") == "worker-only" for h in worker_requests))
+        self.assertTrue(all("x-agent" not in h for h in manager_requests))
+        self.assertTrue(all(h.get("user-agent") == "MyCustomAgent/9.9" for h in lowered))
+
+    def test_cloudflare_block_reports_actionable_error(self) -> None:
+        server = ServerFixture("images", block_mode="cloudflare")
+        self.addCleanup(server.stop)
+        tmp = tempfile.TemporaryDirectory(prefix="agent-team-cf-")
+        self.addCleanup(tmp.cleanup)
+
+        saved_env = dict(os.environ)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved_env)))
+        for key in [k for k in os.environ if k.split("_")[0] in {"MANAGER", "WORKER", "IMAGE", "HTTP"}]:
+            os.environ.pop(key, None)
+
+        root = Path(tmp.name)
+        cfg = build_project(root, server.base_url, "images")
+        reporter = at.Reporter(cfg.logs_dir, quiet=True)
+        orchestrator = at.Orchestrator(cfg, reporter, at.ClientFactory(cfg, reporter))
+
+        with self.assertRaises(at.EndpointError) as ctx:
+            orchestrator.run(at.discover_tasks(cfg))
+
+        message = str(ctx.exception)
+        self.assertEqual(ctx.exception.status, 403)
+        self.assertIn("Cloudflare", message)
+        self.assertIn("curl_cffi", message)
+        self.assertIn("HTTP_USER_AGENT", message)
+        # error 1010 is explicitly not retryable: exactly one request must be sent
+        self.assertEqual(len(server.state.request_headers), 1)
+
+    @unittest.skipUnless(
+        at.http_backend() == "curl_cffi",
+        "curl_cffi not installed (pip install curl_cffi to test browser impersonation)",
+    )
+    def test_curl_cffi_backend_when_installed(self) -> None:
+        outcomes, root, cfg, state = self._run("images")
+        self.assertEqual([o.status for o in outcomes], ["done"], outcomes[0].notes)
+        agents = [h.get("User-Agent", "") for h in state.request_headers]
+        self.assertTrue(all("Chrome/" in a for a in agents))
+        self.assertTrue(all("python" not in a.lower() for a in agents))
 
 
 if __name__ == "__main__":

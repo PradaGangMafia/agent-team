@@ -1,0 +1,19 @@
+# Secrets
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Run artefacts (keep the folders, ignore their contents)
+logs/*
+!logs/.gitkeep
+work/*
+!work/.gitkeep
+
+# OS noise
+.DS_Store
+Thumbs.db

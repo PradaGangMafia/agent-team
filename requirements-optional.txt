@@ -4,3 +4,6 @@
 # Browser-grade TLS fingerprint (defeats Cloudflare error 1010 signature bans):
 #     pip install -r requirements-optional.txt
 curl_cffi>=0.7
+# Downscales reference images before they are attached to the conversation,
+# which keeps local-model prompts small and fast:
+Pillow>=10.0

@@ -313,5 +313,92 @@ class TestSimulatedWorkflow(TempProject):
         self.assertEqual(factory.worker.runs, self.cfg.max_task_attempts)
 
 
+class TestHistoryTrimming(unittest.TestCase):
+    def _history(self) -> list[dict]:
+        return [
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "the task"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "look at this"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64," + "A" * 5000},
+                    },
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": '{"path": "ref/master.py"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "X" * 20000},
+            {"role": "assistant", "content": "recent reasoning", "tool_calls": []},
+        ]
+
+    def test_small_history_is_untouched(self) -> None:
+        history = self._history()
+        before = json.dumps(history)
+        at.trim_history(history, 10_000_000)
+        self.assertEqual(json.dumps(history), before)
+
+    def test_images_are_dropped_first(self) -> None:
+        history = self._history()
+        at.trim_history(history, 6000, keep_recent=1)
+        parts = history[2]["content"]
+        self.assertTrue(any("removed from history" in str(p) for p in parts))
+        self.assertNotIn("image_url", json.dumps(parts))
+
+    def test_old_tool_output_is_truncated_but_recent_turns_survive(self) -> None:
+        history = self._history()
+        at.trim_history(history, 6000, keep_recent=1)
+        self.assertLess(len(history[4]["content"]), 1000)
+        self.assertIn("trimmed", history[4]["content"])
+        self.assertEqual(history[-1]["content"], "recent reasoning")
+
+    def test_structure_preserved(self) -> None:
+        history = self._history()
+        at.trim_history(history, 2000, keep_recent=1)
+        assistant = history[3]
+        tool = history[4]
+        self.assertEqual(assistant["tool_calls"][0]["id"], "call_1")
+        self.assertEqual(tool["tool_call_id"], "call_1")
+        self.assertEqual(history[0]["role"], "system")
+
+
+class TestAttachmentDataUrl(TempProject):
+    def test_returns_data_url(self) -> None:
+        path = self.cfg.ref_dir / "tiny.png"
+        path.write_bytes(
+            base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="
+            )
+        )
+        url = at.attachment_data_url(path)
+        self.assertTrue(url.startswith("data:image/"))
+        self.assertIn("base64,", url)
+
+    @unittest.skipUnless(
+        __import__("importlib").util.find_spec("PIL") is not None,
+        "Pillow not installed (optional; used for image downscaling)",
+    )
+    def test_large_image_is_downscaled(self) -> None:
+        from PIL import Image
+
+        path = self.cfg.ref_dir / "big.png"
+        Image.new("RGB", (2600, 2600), (200, 30, 30)).save(path)
+        raw = at.data_url(path)
+        scaled = at.attachment_data_url(path, max_dim=512, quality=80)
+        self.assertTrue(scaled.startswith("data:image/jpeg;base64,"))
+        self.assertLess(len(scaled), len(raw))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

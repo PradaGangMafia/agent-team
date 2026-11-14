@@ -18,6 +18,12 @@ The two agents each have their own base URL, API key, model and sampling
 configuration (see ``example.env``), so the manager can be a cheap model and
 the worker a strong one - or two different providers entirely.
 
+Requests identify as a real desktop browser (user agent, client hints, and -
+with the optional ``curl_cffi`` package - a matching TLS fingerprint), because
+Cloudflare's bot protection rejects the default Python signature with
+"Error 1010: browser_signature_banned". See ``example.env`` for
+``HTTP_BACKEND`` / ``HTTP_USER_AGENT`` / ``*_HEADERS_JSON``.
+
 Image work is first class: the worker can generate images from one or many
 master images through the OpenAI-compatible ``/v1/images/edits`` and
 ``/v1/images/generations`` endpoints, with a multimodal ``/v1/chat/completions``
@@ -70,7 +76,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # ---------------------------------------------------------------------------
 # Small helpers: console output, ids, natural sorting
@@ -268,6 +274,7 @@ class AgentConfig:
     timeout: float = 300.0
     extra_body: dict[str, Any] = field(default_factory=dict)
     tokens_param: str = "max_tokens"
+    headers: dict[str, str] = field(default_factory=dict)
 
     @property
     def endpoint(self) -> str:
@@ -288,6 +295,10 @@ class AgentConfig:
             or (dict(fb.extra_body) if fb else {}),
             tokens_param=env_str(f"{prefix}_TOKENS_PARAM", fb.tokens_param if fb else "max_tokens")
             or "max_tokens",
+            headers={
+                str(k): str(v)
+                for k, v in (env_json(f"{prefix}_HEADERS_JSON") or dict(fb.headers if fb else {})).items()
+            },
         )
 
     def masked(self) -> str:
@@ -318,6 +329,7 @@ class ImageConfig:
     chat_fallback: bool = True
     keep_chat_model: str = ""
     max_ref_bytes: int = 20 * 1024 * 1024
+    headers: dict[str, str] = field(default_factory=dict)
 
     @property
     def generate_endpoint(self) -> str:
@@ -347,6 +359,7 @@ class ImageConfig:
             timeout=env_float("IMAGE_TIMEOUT", 600.0),
             chat_fallback=env_bool("IMAGE_CHAT_FALLBACK", True),
             keep_chat_model=env_str("IMAGE_CHAT_MODEL", ""),
+            headers={str(k): str(v) for k, v in env_json("IMAGE_HEADERS_JSON").items()},
         )
 
     def masked(self) -> str:
@@ -480,6 +493,187 @@ class EndpointError(RuntimeError):
 
 RETRY_STATUS = {408, 409, 425, 429, 500, 502, 503, 504, 522, 524}
 
+# A current desktop Chrome UA. Python's default "Python-urllib/3.x" is exactly
+# what Cloudflare's bot protection (error 1010, "browser signature banned")
+# rejects, so every request now looks like a browser unless configured otherwise.
+DEFAULT_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+CF_MARKERS = (
+    "cloudflare",
+    "error 1010",
+    "error 1020",
+    "browser_signature_banned",
+    "browser signature",
+    "cf-mitigated",
+    "just a moment",
+    "attention required",
+    "checking your browser",
+)
+
+CF_HINT = (
+    "Cloudflare blocked this request. Errors 1010/1020 and 'Just a moment' pages are "
+    "bot-protection rejections of the client signature: retrying will not help.\n"
+    "  Fixes, best first:\n"
+    "  1. pip install curl_cffi   (agent_team.py then impersonates Chrome's TLS/JA3 "
+    "fingerprint, not just its headers - this is what defeats error 1010; force it with "
+    "HTTP_BACKEND=curl_cffi)\n"
+    "  2. Point HTTP_USER_AGENT at your real browser UA, and/or pass cookies via "
+    "HTTP_HEADERS_JSON='{\"Cookie\": \"cf_clearance=...\"}'\n"
+    "  3. If Cloudflare Access fronts the endpoint, add CF-Access-Client-Id / "
+    "CF-Access-Client-Secret through WORKER_HEADERS_JSON / MANAGER_HEADERS_JSON\n"
+    "  4. Or exempt this endpoint from bot protection in the Cloudflare dashboard "
+    "(WAF custom rule / IP allowlist)"
+)
+
+_curl_module: Any | None = None
+_curl_checked = False
+
+
+def _curl_cffi() -> Any | None:
+    """Return the optional curl_cffi.requests module, or None."""
+    global _curl_module, _curl_checked
+    if not _curl_checked:
+        _curl_checked = True
+        try:  # optional dependency: browser-grade TLS fingerprint
+            from curl_cffi import requests as curl_requests  # type: ignore
+
+            _curl_module = curl_requests
+        except Exception:
+            _curl_module = None
+    return _curl_module
+
+
+def http_backend() -> str:
+    """Which transport to use: 'curl_cffi' (browser impersonation) or 'urllib'."""
+    choice = (env_str("HTTP_BACKEND", "auto") or "auto").lower()
+    if choice in {"urllib", "python", "stdlib"}:
+        return "urllib"
+    available = _curl_cffi() is not None
+    if choice in {"curl_cffi", "curl-cffi", "browser", "impersonate"}:
+        return "curl_cffi" if available else "urllib"
+    if choice not in {"auto", ""}:
+        return "curl_cffi" if available else "urllib"
+    return "curl_cffi" if available else "urllib"
+
+
+def browser_headers() -> dict[str, str]:
+    """Browser-like request headers, overridable from the environment."""
+    globals_extra = {str(k): str(v) for k, v in env_json("HTTP_HEADERS_JSON").items()}
+    if not env_bool("HTTP_BROWSER_HEADERS", True):
+        headers: dict[str, str] = {"Accept": "application/json, text/plain, */*"}
+        ua = env_str("HTTP_USER_AGENT")
+        if ua:
+            headers["User-Agent"] = ua
+        headers.update(globals_extra)
+        return headers
+
+    ua = env_str("HTTP_USER_AGENT") or DEFAULT_BROWSER_UA
+    headers = {
+        "User-Agent": ua,
+        "Accept": env_str("HTTP_ACCEPT") or "application/json, text/plain, */*",
+        "Accept-Language": env_str("HTTP_ACCEPT_LANGUAGE") or "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+    version = re.search(r"Chrome/(\d+)", ua)
+    if version:
+        v = version.group(1)
+        headers.update(
+            {
+                "Sec-Ch-Ua": f'"Chromium";v="{v}", "Not_A Brand";v="24", '
+                f'"Google Chrome";v="{v}"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"Windows"',
+            }
+        )
+    headers.update(globals_extra)
+    return headers
+
+
+def _auth_headers(api_key: str, extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Browser headers + per-agent overrides + bearer token."""
+    headers = browser_headers()
+    for key, value in (extra or {}).items():
+        headers[str(key)] = str(value)
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+def _looks_like_cloudflare(status: int | None, body: str, content_type: str = "") -> bool:
+    haystack = f"{body}\n{content_type}".lower()
+    if any(marker in haystack for marker in CF_MARKERS):
+        return True
+    return status in {403, 429, 503} and "text/html" in content_type.lower()
+
+
+def _http_error(url: str, status: int, body: str, content_type: str = "") -> EndpointError:
+    message = f"HTTP {status} from {url}: {short(body, 600)}"
+    if _looks_like_cloudflare(status, body, content_type):
+        message += "\n" + CF_HINT
+    return EndpointError(message, status, body)
+
+
+def _cloudflare_error(url: str, body: str) -> EndpointError:
+    return EndpointError(
+        f"{url} answered with a Cloudflare bot-protection page instead of JSON "
+        f"({short(body, 200)}).\n{CF_HINT}"
+    )
+
+
+def _raw_request(
+    url: str,
+    data: bytes | None,
+    headers: dict[str, str],
+    method: str,
+    timeout: float,
+) -> tuple[int, bytes, str, Any]:
+    """One HTTP exchange -> (status, body, content_type, response_headers)."""
+    if http_backend() == "curl_cffi":
+        module = _curl_cffi()
+        if module is not None:
+            response = module.request(
+                method,
+                url,
+                data=data,
+                headers=headers,
+                timeout=timeout,
+                impersonate=env_str("HTTP_IMPERSONATE", "chrome") or "chrome",
+                allow_redirects=True,
+            )
+            return (
+                int(response.status_code),
+                bytes(response.content),
+                response.headers.get("Content-Type", ""),
+                response.headers,
+            )
+
+    request = urllib.request.Request(url, data=data, method=method)
+    for key, value in headers.items():
+        request.add_header(key, value)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return (
+                int(getattr(response, "status", 200) or 200),
+                response.read(),
+                response.headers.get("Content-Type", ""),
+                response.headers,
+            )
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read()
+        except Exception:
+            body = b""
+        return (
+            int(exc.code),
+            body,
+            (exc.headers.get("Content-Type", "") if exc.headers else ""),
+            exc.headers or {},
+        )
+
 
 def _request_bytes(
     url: str,
@@ -491,41 +685,39 @@ def _request_bytes(
     retries: int = 4,
 ) -> tuple[bytes, str]:
     """POST/GET with retry + backoff. Returns (body, content_type)."""
-    last_error: Exception | None = None
-    for attempt in range(retries):
-        req = urllib.request.Request(url, data=data, method=method)
-        for k, v in (headers or {}).items():
-            req.add_header(k, v)
+    attempts = max(1, retries)
+    last_error: EndpointError | None = None
+    for attempt in range(attempts):
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as response:
-                return response.read(), response.headers.get("Content-Type", "")
-        except urllib.error.HTTPError as exc:
-            body = ""
-            try:
-                body = exc.read().decode("utf-8", "replace")
-            except Exception:
-                pass
-            last_error = EndpointError(
-                f"HTTP {exc.code} from {url}: {short(body, 600)}", exc.code, body
+            status, raw, content_type, response_headers = _raw_request(
+                url, data, dict(headers or {}), method, timeout
             )
-            if exc.code not in RETRY_STATUS or attempt == retries - 1:
-                raise last_error
-            retry_after = exc.headers.get("Retry-After") if exc.headers else None
-            delay = float(retry_after) if (retry_after or "").replace(".", "", 1).isdigit() else min(2 ** attempt, 20)
-            time.sleep(delay + random.uniform(0, 0.5))
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        except Exception as exc:  # network/DNS/TLS/timeouts from either backend
             last_error = EndpointError(f"network error talking to {url}: {exc}")
-            if attempt == retries - 1:
+            if attempt == attempts - 1:
                 raise last_error
             time.sleep(min(2 ** attempt, 20) + random.uniform(0, 0.5))
+            continue
+
+        if status < 400:
+            return raw, content_type
+
+        body = raw.decode("utf-8", "replace")
+        last_error = _http_error(url, status, body, content_type)
+        if status not in RETRY_STATUS or attempt == attempts - 1:
+            raise last_error
+        retry_after = None
+        try:
+            retry_after = response_headers.get("Retry-After") if response_headers else None
+        except Exception:
+            retry_after = None
+        delay = (
+            float(retry_after)
+            if (retry_after or "").replace(".", "", 1).isdigit()
+            else min(2 ** attempt, 20)
+        )
+        time.sleep(delay + random.uniform(0, 0.5))
     raise last_error or EndpointError(f"request to {url} failed")
-
-
-def _auth_headers(api_key: str) -> dict[str, str]:
-    headers = {"Accept": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    return headers
 
 
 def _multipart(
@@ -631,24 +823,27 @@ class ChatClient:
         payload.update(self.cfg.extra_body)
 
         body = json.dumps(payload).encode("utf-8")
-        headers = _auth_headers(self.cfg.api_key)
+        headers = _auth_headers(self.cfg.api_key, self.cfg.headers)
         headers["Content-Type"] = "application/json"
 
         self.calls += 1
         started = time.time()
-        raw, _ = _request_bytes(
+        raw, response_type = _request_bytes(
             self.cfg.endpoint,
             data=body,
             headers=headers,
             timeout=timeout or self.cfg.timeout,
         )
         elapsed = time.time() - started
+        text = raw.decode("utf-8", "replace")
         try:
-            data = json.loads(raw.decode("utf-8", "replace"))
+            data = json.loads(text)
         except json.JSONDecodeError as exc:
+            if _looks_like_cloudflare(None, text, response_type):
+                raise _cloudflare_error(self.cfg.endpoint, text) from exc
             raise EndpointError(
                 f"{self.cfg.role}: response from {self.cfg.endpoint} was not JSON: "
-                f"{short(raw.decode('utf-8', 'replace'), 400)}"
+                f"{short(text, 400)}"
             ) from exc
 
         choices = data.get("choices") or []
@@ -750,7 +945,7 @@ class ImageService:
             "quality": quality,
             "response_format": self.cfg.response_format,
         }
-        headers = _auth_headers(self.cfg.api_key)
+        headers = _auth_headers(self.cfg.api_key, self.cfg.headers)
 
         if refs:
             files: list[tuple[str, str, bytes, str]] = []
@@ -837,7 +1032,10 @@ class ImageService:
                 raw, _ = _request_bytes(
                     cfg.endpoint,
                     data=json.dumps(payload).encode("utf-8"),
-                    headers={**_auth_headers(cfg.api_key), "Content-Type": "application/json"},
+                    headers={
+                        **_auth_headers(cfg.api_key, cfg.headers),
+                        "Content-Type": "application/json",
+                    },
                     timeout=max(self.cfg.timeout, cfg.timeout),
                 )
             except EndpointError:
@@ -846,7 +1044,10 @@ class ImageService:
                 raw, _ = _request_bytes(
                     cfg.endpoint,
                     data=json.dumps(payload).encode("utf-8"),
-                    headers={**_auth_headers(cfg.api_key), "Content-Type": "application/json"},
+                    headers={
+                        **_auth_headers(cfg.api_key, cfg.headers),
+                        "Content-Type": "application/json",
+                    },
                     timeout=max(self.cfg.timeout, cfg.timeout),
                 )
             data = json.loads(raw.decode("utf-8", "replace"))
@@ -868,10 +1069,13 @@ class ImageService:
 
     # -- helpers ---------------------------------------------------------
     def _save_images(self, raw: bytes, output: Path, count: int, backend: str) -> list[Path]:
+        text = raw.decode("utf-8", "replace")
         try:
-            data = json.loads(raw.decode("utf-8", "replace"))
+            data = json.loads(text)
         except json.JSONDecodeError as exc:
-            raise EndpointError(f"image endpoint returned non-JSON: {short(raw.decode('utf-8', 'replace'), 400)}") from exc
+            if _looks_like_cloudflare(None, text):
+                raise _cloudflare_error(self.cfg.edit_endpoint, text) from exc
+            raise EndpointError(f"image endpoint returned non-JSON: {short(text, 400)}") from exc
         items = data.get("data") or []
         saved: list[Path] = []
         for item in items:
@@ -902,7 +1106,10 @@ def _indexed_path(output: Path, index: int, count: int) -> Path:
 
 
 def _download(url: str) -> bytes:
-    raw, _ = _request_bytes(url, method="GET", retries=3, timeout=300.0)
+    # No Authorization header here: signed image URLs live on CDNs, not the API.
+    raw, _ = _request_bytes(
+        url, method="GET", headers=browser_headers(), retries=3, timeout=300.0
+    )
     return raw
 
 
@@ -2417,6 +2624,19 @@ def cmd_doctor(cfg: Config, reporter: Reporter, args: argparse.Namespace) -> int
             reporter.raw(f"  {yellow('!')} {label} API key is empty (ok for local servers)")
         if agent.base_url:
             reporter.raw(f"    {label}: {agent.model} → {agent.endpoint}  key={agent.masked()}")
+    backend = http_backend()
+    impersonation = env_str("HTTP_IMPERSONATE", "chrome") or "chrome"
+    reporter.raw(
+        f"    client: {backend}"
+        + (f" (impersonating {impersonation})" if backend == "curl_cffi" else "")
+        + f" · UA {short(browser_headers().get('User-Agent', ''), 60)}"
+    )
+    if backend == "urllib":
+        reporter.raw(
+            f"  {yellow('!')} stdlib transport — if Cloudflare answers 403/1010, "
+            "`pip install curl_cffi` for a browser TLS fingerprint"
+        )
+
     if cfg.image.model or cfg.image.mode == "chat":
         reporter.raw(
             f"    images: {cfg.image.model or '(chat fallback)'} → "
@@ -2438,7 +2658,7 @@ def cmd_doctor(cfg: Config, reporter: Reporter, args: argparse.Namespace) -> int
                 body, _ = _request_bytes(
                     agent.base_url.rstrip("/") + "/models",
                     method="GET",
-                    headers=_auth_headers(agent.api_key),
+                    headers=_auth_headers(agent.api_key, agent.headers),
                     timeout=30,
                     retries=1,
                 )

@@ -27,6 +27,7 @@ tasks/P01.md ──▶ MANAGER ──▶ WORKER ──▶ work/ + logs/p01.log
 
 ```bash
 cp example.env .env          # add your endpoint + keys
+pip install curl_cffi        # optional: browser-grade TLS (see Cloudflare below)
 python agent_team.py doctor  # checks config, folders, prompts, endpoints
 python agent_team.py run     # executes the queue in order
 ```
@@ -200,6 +201,45 @@ The shipped example queue is real work, not fixtures: `ref/master.py` contains
 deliberate defects for P01/P02 to find and fix, and `ref/master_image.png` is a
 master artwork for P03's image batch.
 
+## Cloudflare / bot protection
+
+Self-hosted endpoints behind Cloudflare often answer with:
+
+```
+HTTP 403 ... "title": "Error 1010: Access denied",
+"detail": "The site owner has blocked access based on your browser's signature."
+```
+
+That is Cloudflare rejecting Python's default `Python-urllib/3.x` signature — it
+is explicitly **not retryable**. Agent-Team handles it in three layers:
+
+1. **Browser headers by default.** Every request sends a current desktop Chrome
+   `User-Agent`, `Accept-Language`, `sec-ch-ua` client hints and cache headers.
+   This alone clears most `1010` bans.
+2. **Browser TLS fingerprint (optional).** `pip install curl_cffi` makes the
+   transport impersonate Chrome end to end (JA3/JA4 included), which is what
+   defeats signature checks that inspect the TLS handshake rather than headers.
+   `HTTP_BACKEND=auto` (default) picks it up automatically; force with
+   `HTTP_BACKEND=curl_cffi` or disable with `HTTP_BACKEND=urllib`.
+3. **Actionable errors.** A block is reported once, with the exact fix list
+   instead of a bare 403 — and never retried.
+
+Overrides, when the endpoint needs something specific:
+
+```ini
+HTTP_USER_AGENT=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ... Chrome/131.0.0.0
+HTTP_HEADERS_JSON={"Cookie": "cf_clearance=..."}
+WORKER_HEADERS_JSON={"CF-Access-Client-Id": "...", "CF-Access-Client-Secret": "..."}
+```
+
+`MANAGER_HEADERS_JSON`, `WORKER_HEADERS_JSON` and `IMAGE_HEADERS_JSON` are
+merged per endpoint over the global headers, so a Cloudflare Access service
+token can be attached to the worker only. API keys are never sent to image CDNs.
+
+If all of that still fails, the endpoint's own Cloudflare rules are the
+problem: exempt it from bot protection (WAF custom rule, IP allowlist) or put
+it behind a tunnel that does not inject a challenge.
+
 ## Safety
 
 - **Path sandbox:** every tool path is resolved against the project root;
@@ -211,7 +251,11 @@ master artwork for P03's image batch.
 - **Cost:** each task can use dozens of model calls. `WORKER_MAX_ROUNDS` and
   `MANAGER_MAX_ROUNDS` bound each attempt; `MAX_TASK_ATTEMPTS` bounds retries.
 - **Keys** live in `.env` (git-ignored) or the environment. They are never
-  printed unmasked.
+  printed unmasked, and are only ever sent to the endpoint host — never to
+  image download URLs.
+- **Fingerprint:** requests identify as a desktop browser by default (that is
+  the point — see Cloudflare above). Set `HTTP_BROWSER_HEADERS=false` if you
+  would rather be honest about the client.
 
 ## Troubleshooting
 
